@@ -1,0 +1,91 @@
+name: OCI A1 capacity hunt
+
+on:
+  schedule:
+    # Svakih 30 minuta, 03:00-09:00 UTC = 05:00-11:00 po nasem vremenu (najbolji prozor).
+    # ~14 pokretanja dnevno, oko 1300 min/mesec - staje u besplatnu kvotu privatnog repoa.
+    # Ako je repo javan (neograniceni minuti), slobodno stavi: '*/10 * * * *'
+    - cron: '*/30 3-9 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: oci-capacity-hunt
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      STACK_PREFIX: calibraq
+
+    steps:
+      - name: Instaliraj OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Prekini ako instanca vec postoji
+        run: |
+          set -euo pipefail
+          EXISTING=$(oci compute instance list \
+            --compartment-id "$OCI_CLI_TENANCY" --all --output json \
+            | jq -r '.data[] | select(.["lifecycle-state"] != "TERMINATED")
+                     | "\(.["display-name"]) [\(.["lifecycle-state"])]"')
+          if [ -n "$EXISTING" ]; then
+            echo "Instanca vec postoji, nista se ne pokrece:"
+            echo "$EXISTING"
+            echo "STOP=1" >> "$GITHUB_ENV"
+          else
+            echo "Nema aktivnih instanci - nastavljam."
+            echo "STOP=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Pokusaj apply na jednom stack-u
+        if: env.STOP == '0'
+        run: |
+          set -euo pipefail
+
+          mapfile -t STACKS < <(oci resource-manager stack list \
+            --compartment-id "$OCI_CLI_TENANCY" --lifecycle-state ACTIVE --all --output json \
+            | jq -r --arg p "$STACK_PREFIX" \
+                '.data[] | select(.["display-name"] | startswith($p)) | .id' | sort)
+
+          COUNT=${#STACKS[@]}
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Nije pronadjen nijedan stack sa prefiksom '$STACK_PREFIX'."
+            exit 1
+          fi
+
+          # Rotacija: svako pokretanje uzima sledeci stack po redu.
+          IDX=$(( ${GITHUB_RUN_NUMBER:-0} % COUNT ))
+          STACK="${STACKS[$IDX]}"
+          NAME=$(oci resource-manager stack get --stack-id "$STACK" \
+                 --query 'data."display-name"' --raw-output)
+
+          echo "Stack $((IDX + 1))/$COUNT: $NAME"
+
+          RESULT=$(oci resource-manager job create-apply-job \
+            --stack-id "$STACK" \
+            --execution-plan-strategy AUTO_APPROVED \
+            --wait-for-state SUCCEEDED --wait-for-state FAILED \
+            --max-wait-seconds 600 --wait-interval-seconds 15 \
+            --output json 2>&1 || true)
+
+          STATE=$(echo "$RESULT" | jq -r '.data."lifecycle-state" // "UNKNOWN"' 2>/dev/null || echo UNKNOWN)
+          echo "Ishod: $STATE"
+
+          if [ "$STATE" = "SUCCEEDED" ]; then
+            echo "USPELO! Instanca je kreirana preko stack-a: $NAME"
+            oci compute instance list --compartment-id "$OCI_CLI_TENANCY" --all \
+              --query 'data[].{ime:"display-name",stanje:"lifecycle-state"}' --output table
+            # Namerni fail: GitHub podrazumevano salje mejl samo za NEUSPESNE
+            # workflow-e, pa je ovo najlaksi nacin da odmah dobijes obavestenje.
+            # Ako ti to smeta, obrisi sledecu liniju.
+            exit 1
+          fi
+
+          echo "Nema kapaciteta - sledeci pokusaj po rasporedu."
