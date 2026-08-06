@@ -68,15 +68,28 @@ jobs:
 
           echo "Stack $((IDX + 1))/$COUNT: $NAME"
 
-          RESULT=$(oci resource-manager job create-apply-job \
+          JOB_ID=$(oci resource-manager job create-apply-job \
             --stack-id "$STACK" \
             --execution-plan-strategy AUTO_APPROVED \
-            --wait-for-state SUCCEEDED --wait-for-state FAILED \
-            --max-wait-seconds 600 --wait-interval-seconds 15 \
-            --output json 2>&1 || true)
+            --query 'data.id' --raw-output)
+          echo "Job: $JOB_ID"
 
-          STATE=$(echo "$RESULT" | jq -r '.data."lifecycle-state" // "UNKNOWN"' 2>/dev/null || echo UNKNOWN)
+          # Sami pratimo stanje - oci --wait pise poruke na stderr i kvari JSON.
+          STATE=UNKNOWN
+          for _ in $(seq 1 40); do
+            STATE=$(oci resource-manager job get --job-id "$JOB_ID" \
+                    --query 'data."lifecycle-state"' --raw-output)
+            case "$STATE" in
+              SUCCEEDED|FAILED|CANCELED) break ;;
+            esac
+            sleep 15
+          done
           echo "Ishod: $STATE"
+
+          if [ "$STATE" = "FAILED" ]; then
+            oci resource-manager job get-job-logs --job-id "$JOB_ID" --output json 2>/dev/null \
+              | jq -r '.data[]?.message // empty' | grep -iE "error|capacity" | tail -3 || true
+          fi
 
           if [ "$STATE" = "SUCCEEDED" ]; then
             echo "USPELO! Instanca je kreirana preko stack-a: $NAME"
