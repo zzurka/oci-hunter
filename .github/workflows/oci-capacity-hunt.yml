@@ -5,7 +5,7 @@ on:
     # Svakih 30 minuta, 03:00-09:00 UTC = 05:00-11:00 po nasem vremenu (najbolji prozor).
     # ~14 pokretanja dnevno, oko 1300 min/mesec - staje u besplatnu kvotu privatnog repoa.
     # Ako je repo javan (neograniceni minuti), slobodno stavi: '*/10 * * * *'
-    - cron: '*/30 3-9 * * *'
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 concurrency:
